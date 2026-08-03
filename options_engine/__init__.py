@@ -24,6 +24,19 @@ from options_engine.pricing.black_scholes import (
     put_price,
 )
 
+# Phase 4/5 surface tools. ml_surface is *not* imported here: it requires torch,
+# and this module must stay importable with only the core numeric stack.
+from options_engine.vol_surface.implied_vol import (
+    implied_volatility,
+    implied_volatility_array,
+)
+from options_engine.vol_surface.svi import (
+    SVIParameters,
+    fit_svi_slice,
+    fit_svi_surface,
+    svi_surface_volatility,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -47,5 +60,11 @@ __all__ = [
     "Greeks",
     "all_greeks",
     "numerical_greeks",
+    "implied_volatility",
+    "implied_volatility_array",
+    "SVIParameters",
+    "fit_svi_slice",
+    "fit_svi_surface",
+    "svi_surface_volatility",
     "__version__",
 ]
