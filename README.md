@@ -7,9 +7,16 @@ read and explained, not to be fast.
 Every non-obvious numerical choice is justified in a comment where it is made.
 If something looks arbitrary, the reasoning is next to it.
 
-**Status:** Phases 1–4 complete (Black-Scholes, Greeks, CRR binomial tree, Monte
-Carlo with variance reduction and exotics, real-market implied volatility and the
-smile). Phase 5 in progress.
+**Status:** all five phases complete — Black-Scholes and Greeks, the CRR binomial
+tree with American exercise, Monte Carlo with variance reduction and exotics,
+real-market implied volatility and the smile, and a volatility surface fitted both
+parametrically (SVI) and with a neural network.
+
+Several claims in here were **measured and then corrected** when the data disagreed
+with the textbook answer — Richardson extrapolation making the lattice worse,
+antithetic variates failing to compose with a strong control variate, and weight
+decay not actually controlling smoothness. Those are flagged where they occur rather
+than quietly fixed.
 
 ---
 
@@ -36,6 +43,7 @@ python options_engine/notebooks/phase2_binomial_tree.py
 python options_engine/notebooks/phase3_monte_carlo.py
 python options_engine/notebooks/phase4_market_comparison.py          # cached data
 python options_engine/notebooks/phase4_market_comparison.py --fetch  # live data
+python options_engine/notebooks/phase5_ml_vol_surface.py             # needs torch
 ```
 
 Price something:
@@ -75,6 +83,8 @@ options_engine/
     market_data.py       yfinance fetching, cleaning, caching [Phase 4]
   vol_surface/
     implied_vol.py       Newton/Brent implied vol solver      [Phase 4]
+    svi.py               Gatheral SVI smile fit + arbitrage checks [Phase 5]
+    ml_surface.py        PyTorch surface model (optional dep)      [Phase 5]
   tests/                 pytest suite (+ committed market fixture)
   notebooks/             Scripts that generate the figures
 plots/                   Generated figures
@@ -731,10 +741,212 @@ pytest -m network
 
 ---
 
-## Phase 5
+## Phase 5 — SVI and a neural network on the vol surface
 
-- **Phase 5 — ML extension.** A small PyTorch model for the vol surface, compared
-  against a parametric SVI/SABR fit.
+Phase 4 produced a *cloud of points*: one implied vol per traded strike and expiry.
+That isn't yet a surface. Three things are missing — the ability to price strikes
+nobody lists, smoothing of bid-ask noise, and any guarantee the result doesn't imply
+a negative probability density. Phase 5 builds two surfaces that supply them and
+puts them head to head.
+
+Both are fitted to the same 990 usable SPY implied vols across 6 expiries, and both
+are scored in **volatility points (vp)**, where 1 vp = 1% of vol. Scoring them on
+the same objective was a deliberate choice: SVI is classically fitted in total
+variance, but comparing two models trained on different objectives is meaningless,
+so both minimise squared error in vol.
+
+### SVI: five parameters per expiry
+
+[`vol_surface/svi.py`](options_engine/vol_surface/svi.py) implements Gatheral's raw
+parameterisation, which models **total variance** $w(k)=\sigma_{BS}^2 T$ against
+log-moneyness $k=\ln(K/F)$:
+
+$$w(k) = a + b\left(\rho(k-m) + \sqrt{(k-m)^2 + \sigma^2}\right)$$
+
+Total variance, not volatility, because variance is what *adds* across time — which
+makes calendar arbitrage a simple non-crossing condition and makes interpolation
+between expiries linear in $w$. (Interpolating vol linearly in $T$ is a classic
+silent bug.)
+
+Two properties explain why this form, out of the many that fit a smile, is the one
+that stuck. The wings are **asymptotically linear in $k$**, which is exactly what
+Roger Lee's moment formula proves any admissible smile must satisfy — so SVI has the
+right tails by construction, not by luck. And its no-arbitrage region is a set of
+checkable inequalities on five numbers.
+
+The fit is SLSQP (needed for the two genuine inequality constraints a box-bounded
+least-squares can't express) from a **fixed** 9-point start grid — the objective is
+non-convex in $(m,\sigma)$, and a fixed grid keeps calibration reproducible where a
+random multi-start would not. Results:
+
+| Expiry | Quotes | RMSE | ATM vol | ATM skew |
+|---|---|---|---|---|
+| 11d | 109 | 0.236 vp | 11.22% | −0.94 |
+| 28d | 220 | 0.131 vp | 12.28% | −0.71 |
+| 58d | 314 | 0.170 vp | 13.55% | −0.60 |
+| 88d | 208 | 0.083 vp | 14.43% | −0.51 |
+| 179d | 36 | 0.204 vp | 15.61% | −0.35 |
+| 331d | 103 | 0.322 vp | 17.10% | −0.25 |
+
+ATM vol rises with expiry and the skew decays from −0.94 to −0.25 — the $1/\sqrt{T}$
+flattening Phase 4 measured, now recovered as fitted parameters.
+
+**One trap worth flagging**, because it looks like a bug: the fitted `rho` comes out
+*positive* on the front four slices, despite equity skew being unambiguously
+negative. It isn't wrong. `rho` tilts the curve relative to its vertex at $k=m$, and
+on short-dated slices the fitted vertex lands outside the quoted strike range — every
+listed strike sits on the downward-sloping left branch. The quantity a trader means
+by "skew" is $d\sigma/dk$ at $k=0$, which `SVIParameters.atm_skew()` reports and
+which is negative everywhere, as the table shows.
+
+### The network: one joint fit for the whole surface
+
+[`vol_surface/ml_surface.py`](options_engine/vol_surface/ml_surface.py) trains a
+small PyTorch MLP mapping `(strike, time to expiry, moneyness) → implied vol`. Two
+hidden layers of 64, tanh, softplus output, ~4,500 parameters, full-batch Adam with
+early stopping.
+
+**What it adds over SVI is not "nonlinearity" — it is parameter sharing.** SVI fits
+each expiry in isolation, so five parameters are calibrated to the 179-day slice
+using only its 36 noisy quotes, with no knowledge of the neighbouring expiries. The
+network sees the whole surface at once, so sparse slices borrow shape from dense
+ones. That is the real contribution.
+
+| Model | Parameters | RMSE |
+|---|---|---|
+| SVI | 30 (6 slices × 5) | **0.181 vp** in-sample |
+| Network | 4,481 | **0.168 vp** held-out |
+
+A 150× larger model buys essentially nothing in fit quality. That is a genuinely
+useful result to be able to state in an interview: the smile is a smooth,
+low-dimensional object, and five well-chosen parameters already capture it.
+
+### What the ML model captures that Black-Scholes can't
+
+Black-Scholes assumes one constant σ, so it predicts implied vol is a **horizontal
+plane** — the same number at every strike and expiry. Phase 4 measured the actual
+surface and it is nothing of the kind: it slopes down in strike and up in expiry.
+
+That gap is not a calibration failure, it's the assumptions being false. Real returns
+have fat tails and negative skewness, volatility is stochastic and correlated with
+spot (the leverage effect), and the market charges a premium for crash protection.
+Constant-vol has no parameter that can express any of it, so the entire discrepancy
+is pushed into the one free input — **and that displacement is what the smile is**.
+
+So the network does not fix Black-Scholes and is **not a pricing model**: no
+dynamics, no stochastic process, no risk-neutral measure. It never forecasts
+volatility. It is a smooth interpolator whose output is still fed into Black-Scholes
+to produce a price. What it supplies is a *jointly-fitted, differentiable map of
+where the model is wrong* — which is what the vol surface always was.
+
+### The activation choice, and why RMSE would have picked the wrong model
+
+The most important architectural decision here is tanh over ReLU. ReLU networks are
+piecewise linear, so their surfaces have kinks and a second derivative that is zero
+almost everywhere and undefined at the joints. That matters because by
+Breeden–Litzenberger the risk-neutral density **is** the second derivative of call
+price in strike, $q(K)=e^{rT}\,\partial^2C/\partial K^2$. A kinked vol surface
+implies a density of spikes and gaps.
+
+Measured on the same data:
+
+| Activation | Validation RMSE | Peak $\lvert d^2\sigma/dk^2\rvert$ |
+|---|---|---|
+| tanh | 0.168 vp | 15.0 |
+| ReLU | **0.151 vp** | **230.6** |
+| SiLU | 0.238 vp | 12.5 |
+
+**ReLU fits best on the metric everyone reports and is 15× worse on the one that
+decides whether the surface is usable.** Selecting on RMSE alone would have actively
+chosen the broken model. SiLU — smooth, but otherwise ReLU-shaped — is as
+well-behaved as tanh despite the *worst* RMSE of the three, confirming the mechanism
+is smoothness of the activation, not its shape. `plots/phase5_smoothness.png` shows
+the fits lying on top of each other on the left and ReLU's curvature exploding into a
+forest of spikes on the right.
+
+### A regularisation claim I had to retract
+
+I originally wrote that weight decay is the primary smoothness control — the textbook
+answer, since large first-layer weights let a tanh unit act as a sharp switch.
+Sweeping it says otherwise:
+
+| Weight decay | Validation RMSE | Mean $\lvert d^2\sigma/dk^2\rvert$ |
+|---|---|---|
+| 0 | 0.115 vp | 0.66 |
+| 1e-6 | 0.168 vp | 0.58 |
+| 1e-5 | 0.519 vp | 0.53 |
+| 1e-4 | 1.105 vp | 0.49 |
+| 1e-3 | 2.207 vp | 0.53 |
+
+Four orders of magnitude degrades the fit **20×** and reduces roughness by ~20%. It
+isn't buying smoothness; it's buying underfitting, which merely *resembles* smoothness
+because a flat surface is smooth too. The default is now a token 1e-6, and the real
+work is done by the smooth activation and by early stopping.
+
+### Limitations: interpolation vs extrapolation
+
+This is the honest part, and the figure built to show it is
+`plots/phase5_extrapolation.png`.
+
+A random train/validation split flatters both models, because every held-out quote has
+training quotes on both sides — it measures *interpolation*. Withholding the wings
+entirely tests what people actually reach for a fitted surface to do: price a strike
+nobody trades. Training both on the middle 60% of log-moneyness and scoring the wings:
+
+| Model | Inside band | In the wings | Degradation |
+|---|---|---|---|
+| Network | 0.182 vp | 3.243 vp | 17.8× |
+| SVI | 0.105 vp | 2.120 vp | 20.3× |
+
+The network's failure mode is structural: **tanh saturates**. Far from the data every
+unit flattens to ±1 and the output tends to a constant determined by the weights, not
+the market. In the figure it goes flat at ~46% where the true wing is 62%. It isn't
+that the extrapolation is inaccurate — the functional form encodes *no opinion* about
+that region, and the number returned is an artefact of the architecture.
+
+The expected conclusion is that SVI is safe here because Lee's formula constrains its
+wings. The measurement earns SVI a real but modest edge — ~1.5× lower error, and
+visibly better tracking on the left wing — but **not safety**: it degrades by the same
+factor, and 2.1 vol points is not a number to quote a price from. Neither model
+extrapolates.
+
+The difference that does matter is **diagnosability**:
+
+| Check | Within quoted strikes | Extrapolated |
+|---|---|---|
+| Butterfly (`g(k) ≥ 0`) | ✅ all 6 slices | ❌ 4 of 6 fail |
+| Calendar (`w` non-crossing) | ✅ all 5 pairs | ❌ 3 of 5 cross |
+
+Both arbitrage conditions hold everywhere quotes exist and break *only* past the last
+listed strike — which is a much more precise statement than "the fit is arbitrage-free"
+and is why `SVIFitResult` reports `butterfly_free` and `butterfly_free_extrapolated`
+separately. SVI's failure announces itself in closed form; the network has no
+comparable tell. **That asymmetry — guarantee versus inspection — is the real cost of
+the flexibility**, and it is a stronger reason to prefer the parametric model in the
+wings than accuracy is.
+
+### Figures
+
+| File | What it shows |
+|---|---|
+| `plots/phase5_svi_fit.png` | SVI per slice, and fitted total variance with the quoted range shaded |
+| `plots/phase5_ml_vs_svi.png` | Both models on all 6 smiles, with residual panels |
+| `plots/phase5_surface.png` | Both surfaces on a shared colour scale, plus their difference |
+| `plots/phase5_smoothness.png` | tanh vs ReLU vs SiLU: identical fits, incomparable curvature |
+| `plots/phase5_extrapolation.png` | Wings withheld from both models; the honest limitation |
+
+### Running it
+
+PyTorch is an **optional** dependency. `import options_engine` never imports torch, so
+Phases 1–4 work without it, and the Phase 5 tests skip rather than fail when it's
+absent:
+
+```bash
+python options_engine/notebooks/phase5_ml_vol_surface.py
+```
+
+Takes about a minute — most of it training the three networks for the activation
+comparison.
 
 ---
 
@@ -745,3 +957,10 @@ pytest -m network
 - Cox, J., Ross, S. & Rubinstein, M. (1979). *Option Pricing: A Simplified Approach.*
 - Hull, J. C. *Options, Futures, and Other Derivatives.*
 - Glasserman, P. *Monte Carlo Methods in Financial Engineering.*
+- Breeden, D. & Litzenberger, R. (1978). *Prices of State-Contingent Claims Implicit in Option Prices.*
+- Gatheral, J. (2004). *A Parsimonious Arbitrage-Free Implied Volatility Parameterization.*
+- Gatheral, J. & Jacquier, A. (2014). *Arbitrage-Free SVI Volatility Surfaces.*
+- Lee, R. (2004). *The Moment Formula for Implied Volatility at Extreme Strikes.*
+- Zeliade Systems (2009). *Quasi-Explicit Calibration of Gatheral's SVI Model.*
+- Hutchinson, J., Lo, A. & Poggio, T. (1994). *A Nonparametric Approach to Pricing and Hedging Derivative Securities via Learning Networks.*
+- Horvath, B., Muguruza, A. & Tomas, M. (2021). *Deep Learning Volatility.*
