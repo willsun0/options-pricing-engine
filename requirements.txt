@@ -7,9 +7,13 @@ matplotlib>=3.7
 # Testing.
 pytest>=7.4
 
-# Phase 4: market data. Uncomment when you reach that phase.
-# yfinance>=0.2.40
+# Phase 4: live market data. Only needed to *fetch* a fresh option chain. The
+# committed fixture and the cached snapshot let the tests and the Phase 4
+# notebook run offline without it.
+yfinance>=0.2.40
 
-# Phase 5: ML volatility surface. Uncomment when you reach that phase.
-# torch>=2.2
-# scikit-learn>=1.4
+# Phase 5: the neural network volatility surface. Only imported by
+# options_engine.vol_surface.ml_surface and the Phase 5 notebook — the rest of the
+# engine imports fine without it, and the Phase 5 tests skip rather than fail when
+# it is absent.
+torch>=2.2
