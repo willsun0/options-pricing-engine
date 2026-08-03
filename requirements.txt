@@ -1,0 +1,15 @@
+# Core numerics — needed for every phase.
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+
+# Testing.
+pytest>=7.4
+
+# Phase 4: market data. Uncomment when you reach that phase.
+# yfinance>=0.2.40
+
+# Phase 5: ML volatility surface. Uncomment when you reach that phase.
+# torch>=2.2
+# scikit-learn>=1.4
